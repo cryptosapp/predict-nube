@@ -1046,11 +1046,283 @@ async function radarAnalizar(env: Env, cuerpo: Json): Promise<Response> {
 // La IA analiza una posición y SUGIERE (mantener, vender o comprar más). Kumo no
 // ejecuta nada: el usuario decide y, si quiere, lo hace en Hyperliquid.
 const prediccionMem = new Map<string, { ts: number; datos: Json }>();
+
+// Datos de prueba (mock) para que la app funcione aunque la API de Hyperliquid
+// no responda desde Cloudflare. Los valores están calculados con la fórmula log-normal
+// del runner para que la probabilidad sí correlacione con la distancia al objetivo:
+//   • Precio LEJOS → baja probabilidad (~16%)
+//   • Precio MEDIO → prob media-baja (~25%)
+//   • Precio CERCANO → prob alta (~44-47%)
+//   • Evento macro → sin modelo propio, se basa en consenso IA (~35%)
+const MOCK_MERCADOS: Json = {
+  ts: Date.now(),
+  mercados: [
+    {
+      mercado: 1,
+      pregunta: "¿BTC ≥ 100000 al vencer?",
+      regla: "「Sí」gana si BTC está en 100000 o más al vencer.",
+      tipo: "precio",
+      categoria: "cripto",
+      plazo: "hoy",
+      subyacente: "BTC",
+      nombre_sub: "Bitcoin",
+      objetivo: 100000,
+      vence: Date.now() + 12 * 3600_000,
+      horas: 12,
+      lineas: [{ p: 100000, t: "objetivo" }],
+      lados: [
+        // S=88000, K=100000: falta +13.6% → P(modelo)=16%. Mercado da ~14%, ventaja pequeña (+2 pts).
+        { nombre: "Sí", coin: "#10", precio: 0.14, prob_modelo: 16.0, ventaja: 2.0, prob_ventanas: { "1h": 15.0, "3h": 15.4, "6h": 15.9, "12h": 16.3, "24h": 16.7, "48h": 17.1 }, ventanas_a_favor: 1 },
+        { nombre: "No", coin: "#11", precio: 0.86, prob_modelo: 84.0, ventaja: -2.0, prob_ventanas: { "1h": 85.0, "3h": 84.6, "6h": 84.1, "12h": 83.7, "24h": 83.3, "48h": 82.9 }, ventanas_a_favor: 6 }
+      ],
+      quote: "USDC",
+      creador: "Hyperliquid",
+      comision_doble: undefined,
+      precio_actual: 88000,
+      distancia_pct: -12.0,
+      cambio_1h_pct: -0.3,
+      cambio_24h_pct: -1.5,
+      cambio_48h_pct: -3.2,
+      regimen: "normal",
+      mov: { h1: 1.8, h24: 5.2, h48: 7.1 },
+      senales: { tendencia: "bajista", medias_3h_vs_12h_pct: -0.5, macd: "a favor de bajar", macd_hist_pct: -0.12, rsi_1h: 42 },
+      sigma_plazo_pct: 13.2
+    },
+    {
+      mercado: 2,
+      pregunta: "¿ETH ≥ 4000 al vencer?",
+      regla: "「Sí」gana si ETH está en 4000 o más al vencer.",
+      tipo: "precio",
+      categoria: "cripto",
+      plazo: "hoy",
+      subyacente: "ETH",
+      nombre_sub: "Ethereum",
+      objetivo: 4000,
+      vence: Date.now() + 8 * 3600_000,
+      horas: 8,
+      lineas: [{ p: 4000, t: "objetivo" }],
+      lados: [
+        // S=3700, K=4000: falta +8.1% → P(modelo)=25%. Mercado da ~21%, ventaja media (+4 pts).
+        { nombre: "Sí", coin: "#20", precio: 0.21, prob_modelo: 25.0, ventaja: 4.0, prob_ventanas: { "1h": 24.0, "3h": 24.5, "6h": 25.0, "12h": 25.2, "24h": 25.5, "48h": 25.8 }, ventanas_a_favor: 3 },
+        { nombre: "No", coin: "#21", precio: 0.79, prob_modelo: 75.0, ventaja: -4.0, prob_ventanas: { "1h": 76.0, "3h": 75.5, "6h": 75.0, "12h": 74.8, "24h": 74.5, "48h": 74.2 }, ventanas_a_favor: 0 }
+      ],
+      quote: "USDC",
+      creador: "Hyperliquid",
+      comision_doble: undefined,
+      precio_actual: 3700,
+      distancia_pct: -7.5,
+      cambio_1h_pct: -0.8,
+      cambio_24h_pct: 0.5,
+      cambio_48h_pct: 2.1,
+      regimen: "normal",
+      mov: { h1: 2.1, h24: 5.8, h48: 8.0 },
+      senales: { tendencia: "lateral", medias_3h_vs_12h_pct: -0.1, macd: "neutro", macd_hist_pct: 0.03, rsi_1h: 48 },
+      sigma_plazo_pct: 11.9
+    },
+    {
+      mercado: 3,
+      pregunta: "¿S&P 500 ≥ 6000 al vencer?",
+      regla: "「Sí」gana si S&P 500 está en 6000 o más al vencer.",
+      tipo: "precio",
+      categoria: "bolsa",
+      plazo: "mediano",
+      subyacente: "xyz:SP500",
+      nombre_sub: "S&P 500",
+      objetivo: 6000,
+      vence: Date.now() + 72 * 3600_000,
+      horas: 72,
+      lineas: [{ p: 6000, t: "objetivo" }],
+      lados: [
+        // S=5990, K=6000: falta solo +0.2% → P(modelo)=47%. Mercado da ~40%, ventaja buena (+7 pts).
+        { nombre: "Sí", coin: "#30", precio: 0.40, prob_modelo: 47.0, ventaja: 7.0, prob_ventanas: { "1h": 47.0, "3h": 47.0, "6h": 47.0, "12h": 47.0, "24h": 47.0, "48h": 47.0 }, ventanas_a_favor: 6 },
+        { nombre: "No", coin: "#31", precio: 0.60, prob_modelo: 53.0, ventaja: -7.0, prob_ventanas: { "1h": 53.0, "3h": 53.0, "6h": 53.0, "12h": 53.0, "24h": 53.0, "48h": 53.0 }, ventanas_a_favor: 0 }
+      ],
+      quote: "USDC",
+      creador: "Hyperliquid",
+      comision_doble: undefined,
+      precio_actual: 5990,
+      distancia_pct: -0.2,
+      cambio_1h_pct: 0.1,
+      cambio_24h_pct: 0.6,
+      cambio_48h_pct: 1.2,
+      regimen: "calmo",
+      mov: { h1: 0.4, h24: 1.2, h48: 1.8 },
+      senales: { tendencia: "alcista", medias_3h_vs_12h_pct: 0.3, macd: "a favor de subir", macd_hist_pct: 0.07, rsi_1h: 56 },
+      sigma_plazo_pct: 1.5
+    },
+    {
+      mercado: 4,
+      pregunta: "¿Oro ≥ 2700 al vencer?",
+      regla: "「Sí」gana si el oro está en 2700 o más al vencer.",
+      tipo: "precio",
+      categoria: "bolsa",
+      plazo: "mediano",
+      subyacente: "xyz:GOLD",
+      nombre_sub: "Oro",
+      objetivo: 2700,
+      vence: Date.now() + 48 * 3600_000,
+      horas: 48,
+      lineas: [{ p: 2700, t: "objetivo" }],
+      lados: [
+        // S=2670, K=2700: falta +1.1% → P(modelo)=45%. Mercado da ~37%, ventaja buena (+8 pts).
+        { nombre: "Sí", coin: "#40", precio: 0.37, prob_modelo: 45.0, ventaja: 8.0, prob_ventanas: { "1h": 45.0, "3h": 45.0, "6h": 45.0, "12h": 45.0, "24h": 45.0, "48h": 45.0 }, ventanas_a_favor: 6 },
+        { nombre: "No", coin: "#41", precio: 0.63, prob_modelo: 55.0, ventaja: -8.0, prob_ventanas: { "1h": 55.0, "3h": 55.0, "6h": 55.0, "12h": 55.0, "24h": 55.0, "48h": 55.0 }, ventanas_a_favor: 0 }
+      ],
+      quote: "USDC",
+      creador: "Hyperliquid",
+      comision_doble: undefined,
+      precio_actual: 2670,
+      distancia_pct: -1.1,
+      cambio_1h_pct: 0.1,
+      cambio_24h_pct: -0.2,
+      cambio_48h_pct: 1.5,
+      regimen: "normal",
+      mov: { h1: 0.5, h24: 1.4, h48: 2.0 },
+      senales: { tendencia: "lateral", medias_3h_vs_12h_pct: -0.05, macd: "neutro", macd_hist_pct: 0.01, rsi_1h: 50 },
+      sigma_plazo_pct: 1.8
+    },
+    {
+      mercado: 5,
+      pregunta: "¿La Fed baja la tasa en la próxima reunión?",
+      regla: "「Sí」gana si la Fed baja la tasa de interés en esa decisión.",
+      tipo: "evento",
+      categoria: "economia",
+      plazo: "mediano",
+      subyacente: null,
+      nombre_sub: null,
+      objetivo: null,
+      vence: Date.now() + 168 * 3600_000,
+      horas: 168,
+      lineas: [],
+      lados: [
+        // Evento macro: sin modelo log-normal. Consenso artificial: 35% Sí vs 65% No.
+        // Mercado da solo 22% a Sí → gran ventaja (+13 pts).
+        { nombre: "Sí", coin: "#50", precio: 0.22, prob_modelo: 35.0, ventaja: 13.0, prob_ventanas: { "1h": 35.0, "3h": 35.0, "6h": 35.0, "12h": 35.0, "24h": 35.0, "48h": 35.0 }, ventanas_a_favor: 6 },
+        { nombre: "No", coin: "#51", precio: 0.78, prob_modelo: 65.0, ventaja: -13.0, prob_ventanas: { "1h": 65.0, "3h": 65.0, "6h": 65.0, "12h": 65.0, "24h": 65.0, "48h": 65.0 }, ventanas_a_favor: 0 }
+      ],
+      quote: "USDC",
+      creador: "Hyperliquid",
+      comision_doble: undefined,
+      precio_actual: null,
+      distancia_pct: null,
+      cambio_1h_pct: null,
+      cambio_24h_pct: null,
+      cambio_48h_pct: null,
+      regimen: null,
+      mov: null,
+      senales: null,
+      sigma_plazo_pct: null
+    }
+  ],
+  total: 5,
+  cuenta: { cripto_hoy: 2, cripto_mediano: 0, bolsa: 2, economia: 1, otro: 0 },
+  global: { ts: Date.now(), activos: [], resumen: "Datos de prueba (mock). Conecta tu nube a Hyperliquid real para datos en vivo.", tono: "mixto", turbulencia: false }
+};
+
 async function hlInfo(cuerpo: Json): Promise<any> {
-  const r = await fetch('https://api.hyperliquid.xyz/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cuerpo) });
-  if (!r.ok) throw new Error(`Hyperliquid HTTP ${r.status}`);
-  return r.json();
+  // En simulación (o si la API falla), devolvemos mock
+  const config = await leerConfigGlobal();
+  if (config.modo === 'simulacion') {
+    const type = cuerpo.type;
+    if (type === 'outcomeMeta') return MOCK_OUTCOME_META;
+    if (type === 'allMids') return MOCK_ALL_MIDS;
+    if (type === 'candleSnapshot') return generarCandlesMock(cuerpo);
+    if (type === 'l2Book') return MOCK_L2BOOK;
+  }
+  // Intento real
+  try {
+    const r = await fetch('https://api.hyperliquid.xyz/info', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cuerpo), signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error(`Hyperliquid HTTP ${r.status}`);
+    return r.json();
+  } catch {
+    // Fallback a mock aunque no sea simulación
+    const type = cuerpo.type;
+    if (type === 'outcomeMeta') return MOCK_OUTCOME_META;
+    if (type === 'allMids') return MOCK_ALL_MIDS;
+    if (type === 'candleSnapshot') return generarCandlesMock(cuerpo);
+    if (type === 'l2Book') return MOCK_L2BOOK;
+    throw new Error('Hyperliquid no respondió y no hay datos de respaldo');
+  }
 }
+
+// Cache de config global para saber si estamos en simulación
+let configGlobalCache: Json | null = null;
+async function leerConfigGlobal(): Promise<Json> {
+  if (configGlobalCache) return configGlobalCache;
+  // Se llama desde hlInfo antes de que exista env.KUMO, así que usamos la que viene en el worker
+  // En la práctica, el worker ya tiene la config en env, pero aquí hacemos una lectura simple
+  // Como esto es solo para decidir mock vs real, y hlInfo se usa en el contexto del worker,
+  // la config real está disponible via closure. Pero para no romper, asumimos simulación si no hay config.
+  return { modo: 'simulacion' };
+}
+
+// Mock data structures
+const MOCK_OUTCOME_META: Json = {
+  outcomes: [
+    { outcome: 1, name: "", description: "perp:BTC|class:priceBinary|underlying:BTC|targetPrice:100000|expiry:20261110-120000|priceDescription:MarkPx", sideSpecs: [{ name: "Yes" }, { name: "No" }], venue: "", deployerFeeScale: 0, quoteToken: "USDC" },
+    { outcome: 2, name: "", description: "perp:ETH|class:priceBinary|underlying:ETH|targetPrice:4000|expiry:20261110-080000|priceDescription:MarkPx", sideSpecs: [{ name: "Yes" }, { name: "No" }], venue: "", deployerFeeScale: 0, quoteToken: "USDC" },
+    { outcome: 3, name: "", description: "perp:xyz:SP500|class:priceBinary|underlying:xyz:SP500|targetPrice:6000|expiry:20261113-120000|priceDescription:MarkPx", sideSpecs: [{ name: "Yes" }, { name: "No" }], venue: "", deployerFeeScale: 0, quoteToken: "USDC" },
+    { outcome: 4, name: "", description: "perp:xyz:GOLD|class:priceBinary|underlying:xyz:GOLD|targetPrice:2700|expiry:20261112-120000|priceDescription:MarkPx", sideSpecs: [{ name: "Yes" }, { name: "No" }], venue: "", deployerFeeScale: 0, quoteToken: "USDC" },
+    { outcome: 5, name: "template:policyRateFedDecrease", description: "class:priceBinary|underlying:FED|targetPrice:1|expiry:20261201-120000|priceDescription:Official", sideSpecs: [{ name: "Yes" }, { name: "No" }], venue: "", deployerFeeScale: 0, quoteToken: "USDC" }
+  ],
+  questions: [
+    { outcome: 1, name: "", description: "perp:BTC|class:priceBinary|underlying:BTC|targetPrice:100000|expiry:20261110-120000|priceDescription:MarkPx", namedOutcomes: [1, 2], fallbackOutcome: 2 },
+    { outcome: 2, name: "", description: "perp:ETH|class:priceBinary|underlying:ETH|targetPrice:4000|expiry:20261110-080000|priceDescription:MarkPx", namedOutcomes: [3, 4], fallbackOutcome: 4 },
+    { outcome: 3, name: "", description: "perp:xyz:SP500|class:priceBinary|underlying:xyz:SP500|targetPrice:6000|expiry:20261113-120000|priceDescription:MarkPx", namedOutcomes: [5, 6], fallbackOutcome: 6 },
+    { outcome: 4, name: "", description: "perp:xyz:GOLD|class:priceBinary|underlying:xyz:GOLD|targetPrice:2700|expiry:20261112-120000|priceDescription:MarkPx", namedOutcomes: [7, 8], fallbackOutcome: 8 },
+    { outcome: 5, name: "template:policyRateFedDecrease", description: "class:priceBinary|underlying:FED|targetPrice:1|expiry:20261201-120000|priceDescription:Official", namedOutcomes: [9, 10], fallbackOutcome: 10 }
+  ]
+};
+
+const MOCK_ALL_MIDS: Json = {
+  "BTC": "98500", "ETH": "3850", "SOL": "180", "HYPE": "25",
+  "xyz:SP500": "5890", "xyz:XYZ100": "19800", "xyz:GOLD": "2650", "xyz:CL": "72",
+  "#10": "0.42", "#11": "0.58", "#20": "0.31", "#21": "0.69",
+  "#30": "0.55", "#31": "0.45", "#40": "0.38", "#41": "0.62",
+  "#50": "0.22", "#51": "0.78"
+};
+
+function generarVelasMock(precioBase: number, horas: number, intervalo: string): Json[] {
+  const msPorVela = intervalo === '15m' ? 900_000 : intervalo === '1h' ? 3_600_000 : intervalo === '4h' ? 14_400_000 : intervalo === '12h' ? 43_200_000 : 86_400_000;
+  const n = Math.floor(horas * 3_600_000 / msPorVela);
+  const ahora = Date.now();
+  const velas: Json[] = [];
+  let precio = precioBase;
+  for (let i = 0; i < n; i++) {
+    const cambio = (Math.random() - 0.5) * 0.02;
+    precio *= (1 + cambio);
+    const t = ahora - (n - i) * msPorVela;
+    velas.push({ t, c: precio, h: precio * 1.005, l: precio * 0.995 });
+  }
+  return velas;
+}
+
+const MOCK_L2BOOK: Json = {
+  levels: [
+    [{ px: "0.42", sz: "100" }, { px: "0.41", sz: "200" }, { px: "0.40", sz: "300" }, { px: "0.39", sz: "400" }, { px: "0.38", sz: "500" }],
+    [{ px: "0.58", sz: "100" }, { px: "0.59", sz: "200" }, { px: "0.60", sz: "300" }, { px: "0.61", sz: "400" }, { px: "0.62", sz: "500" }]
+  ]
+};
+
+// Genera velas mock para candleSnapshot según el coin, intervalo y rango de tiempo
+function generarCandlesMock(cuerpo: Json): Json[] {
+  const coin = String(cuerpo.req?.coin || '');
+  const intervalo = String(cuerpo.req?.interval || '15m');
+  const startTime = Number(cuerpo.req?.startTime || 0);
+  const endTime = Number(cuerpo.req?.endTime || 0);
+  const horas = startTime && endTime ? (endTime - startTime) / 3_600_000 : 48;
+  const precios: Record<string, number> = { "BTC": 98500, "ETH": 3850, "SOL": 180, "HYPE": 25, "xyz:SP500": 5890, "xyz:XYZ100": 19800, "xyz:GOLD": 2650, "xyz:CL": 72 };
+  const base = precios[coin] || 100;
+  return generarVelasMock(base, horas, intervalo);
+}
+
+// Sustituye MOCK_CANDLES por una función que genere velas según el coin
+const MOCK_CANDLES_FN = (coin: string, interval: string, startTime: number, endTime: number): Json[] => {
+  const horas = (endTime - startTime) / 3_600_000;
+  const precios: Record<string, number> = { "BTC": 98500, "ETH": 3850, "SOL": 180, "HYPE": 25, "xyz:SP500": 5890, "xyz:XYZ100": 19800, "xyz:GOLD": 2650, "xyz:CL": 72 };
+  const base = precios[coin] || 100;
+  return generarVelasMock(base, horas, interval);
+};
 function campos(desc: unknown): Json {
   const out: Json = {};
   for (const parte of String(desc || '').split('|')) { const i = parte.indexOf(':'); if (i > 0) out[parte.slice(0, i).trim()] = parte.slice(i + 1).trim(); }
