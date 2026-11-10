@@ -1,0 +1,7 @@
+{
+  "name": "predict-worker",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": { "deploy": "wrangler deploy", "check": "tsc --noEmit" },
+  "devDependencies": { "@cloudflare/workers-types": "^4.20250101.0", "typescript": "^5.6.0", "wrangler": "^3.100.0" }
+}

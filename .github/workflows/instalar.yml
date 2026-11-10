@@ -1,0 +1,105 @@
+name: Instalar Predict
+
+# Despliega (o actualiza) tu nube de Kumo en TU cuenta de Cloudflare.
+# La app lo lanza sola; también puedes ejecutarlo a mano desde la pestaña Actions.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kumo-instalar
+  cancel-in-progress: false
+
+jobs:
+  instalar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Revisar secretos
+        env:
+          GROQ: ${{ secrets.GROQ_API_KEY }}
+          IA_URL: ${{ secrets.IA_URL }}
+          APP: ${{ secrets.KUMO_APP_TOKEN }}
+          RUN: ${{ secrets.KUMO_RUNNER_TOKEN }}
+        run: |
+          falta=""
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || falta="$falta CLOUDFLARE_API_TOKEN"
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || falta="$falta CLOUDFLARE_ACCOUNT_ID"
+          [ -n "$APP" ] || falta="$falta KUMO_APP_TOKEN"
+          [ -n "$RUN" ] || falta="$falta KUMO_RUNNER_TOKEN"
+          [ -n "$IA_URL$GROQ" ] || echo "::warning::Sin proveedor de IA: el bot funcionará sin IA"
+          if [ -n "$falta" ]; then echo "::error::Faltan secretos:$falta"; exit 1; fi
+
+      - name: Subdominio workers.dev
+        id: sub
+        run: |
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"
+          sub=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api" | jq -r '.result.subdomain // empty' || true)
+          if [ -z "$sub" ]; then
+            nuevo="kumo-$(openssl rand -hex 3)"
+            sub=$(curl -fsS -X PUT -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" \
+              --data "{\"subdomain\":\"$nuevo\"}" "$api" | jq -r '.result.subdomain')
+          fi
+          [ -n "$sub" ] && [ "$sub" != "null" ] || { echo "::error::No pude obtener ni crear el subdominio workers.dev. Revisa los permisos del token de Cloudflare."; exit 1; }
+          echo "sub=$sub" >> "$GITHUB_OUTPUT"
+
+      - name: Base de datos KV
+        id: kv
+        run: |
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/storage/kv/namespaces"
+          id=$(curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api?per_page=100" | jq -r '.result[] | select(.title=="predict-KUMO") | .id' | head -1)
+          if [ -z "$id" ]; then
+            id=$(curl -fsS -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H "Content-Type: application/json" \
+              --data '{"title":"predict-KUMO"}' "$api" | jq -r '.result.id')
+          fi
+          [ -n "$id" ] && [ "$id" != "null" ] || { echo "::error::No pude crear la base KV"; exit 1; }
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+      - name: Desplegar Worker
+        working-directory: worker
+        env:
+          GROQ: ${{ secrets.GROQ_API_KEY }}
+          IA_URL: ${{ secrets.IA_URL }}
+          IA_MODELOS: ${{ secrets.IA_MODELOS }}
+          IA_CLAVE: ${{ secrets.IA_CLAVE }}
+          APP: ${{ secrets.KUMO_APP_TOKEN }}
+          RUN: ${{ secrets.KUMO_RUNNER_TOKEN }}
+        run: |
+          sed "s/__KV_ID__/${{ steps.kv.outputs.id }}/" wrangler.toml.plantilla > wrangler.toml
+          npm install --no-audit --no-fund
+          npx wrangler deploy --var "KUMO_VERSION:$(cat ../runner/version.txt 2>/dev/null || echo 1.0.0)"
+          printf '%s' "$APP" | npx wrangler secret put APP_TOKEN
+          printf '%s' "$RUN" | npx wrangler secret put RUNNER_TOKEN
+          # Secretos de IA: se ponen si existen y se borran si ya no (al cambiar de proveedor).
+          for n in IA_URL IA_MODELOS IA_CLAVE GROQ; do
+            v="${!n}"; nombre="$n"; [ "$n" = GROQ ] && nombre=GROQ_API_KEY
+            if [ -n "$v" ]; then printf '%s' "$v" | npx wrangler secret put "$nombre"
+            else npx wrangler secret delete "$nombre" </dev/null >/dev/null 2>&1 || true; fi
+          done
+
+      - name: Comprobar y guardar la dirección
+        run: |
+          url="https://predict.${{ steps.sub.outputs.sub }}.workers.dev"
+          for i in $(seq 1 20); do
+            if curl -fsS "$url/api/salud" | jq -e '.ok' >/dev/null; then ok=1; break; fi
+            sleep 6
+          done
+          [ -n "$ok" ] || { echo "::error::La nube no respondió en $url"; exit 1; }
+          jq -n --arg url "$url" --arg v "$(jq -r .version worker/package.json)" --arg ts "$(date -u +%FT%TZ)" '{url:$url,version:$v,instalado:$ts}' > kumo.json
+          git config user.name "predict"
+          git config user.email "predict@users.noreply.github.com"
+          git add kumo.json
+          git diff --cached --quiet || git commit -m "Kumo instalado en $url"
+          git push
+          echo "### ☁️ Kumo listo en $url" >> "$GITHUB_STEP_SUMMARY"

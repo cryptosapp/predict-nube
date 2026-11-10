@@ -1,0 +1,61 @@
+name: Ciclo Predict
+
+# Un ciclo cada 30 min. GitHub cobra cada ciclo por minuto entero: el ciclo está hecho
+# para durar menos de 1 min (IA con tope de 30 s y entorno guardado). En un repo público
+# los minutos son gratis e ilimitados; en uno privado son ~1 440 de los 2 000 del mes.
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [kumo-ciclo]
+
+concurrency:
+  group: kumo-ciclo
+  cancel-in-progress: false
+
+jobs:
+  ciclo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ¿Está instalado?
+        id: inst
+        run: |
+          if [ -f kumo.json ]; then echo "ok=1" >> "$GITHUB_OUTPUT"; else echo "Kumo aún no está instalado: ejecuta «Instalar Kumo»."; fi
+
+      - uses: actions/setup-python@v5
+        id: py
+        if: steps.inst.outputs.ok
+        with:
+          python-version: "3.12"
+
+      # Entorno con ccxt ya instalado, guardado entre ciclos: ahorra ~10 s por ciclo.
+      - uses: actions/cache@v4
+        id: venv
+        if: steps.inst.outputs.ok
+        with:
+          path: ~/.venv-kumo
+          key: venv-${{ runner.os }}-${{ steps.py.outputs.python-version }}-${{ hashFiles('runner/requirements.txt') }}
+
+      - name: Dependencias
+        if: steps.inst.outputs.ok && steps.venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv ~/.venv-kumo
+          ~/.venv-kumo/bin/pip install -q -r runner/requirements.txt
+
+      - name: Ejecutar ciclo
+        if: steps.inst.outputs.ok
+        env:
+          KUMO_RUNNER_TOKEN: ${{ secrets.KUMO_RUNNER_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          IA_URL: ${{ secrets.IA_URL }}
+          IA_MODELOS: ${{ secrets.IA_MODELOS }}
+          IA_CLAVE: ${{ secrets.IA_CLAVE }}
+          EXCHANGE_ID: ${{ secrets.EXCHANGE_ID }}
+          EXCHANGE_API_KEY: ${{ secrets.EXCHANGE_API_KEY }}
+          EXCHANGE_SECRET: ${{ secrets.EXCHANGE_SECRET }}
+          EXCHANGE_PASSWORD: ${{ secrets.EXCHANGE_PASSWORD }}
+        run: ~/.venv-kumo/bin/python runner/agente.py

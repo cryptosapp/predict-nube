@@ -1,0 +1,10 @@
+# Lo completa el workflow «Instalar Predict» con tus datos. No edites a mano.
+# Nombre propio: no pisa la nube de Kumo ni la de Kumo Predice si la tienes en la misma cuenta de Cloudflare.
+name = "predict"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "KUMO"
+id = "__KV_ID__"
